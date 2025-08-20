@@ -4,6 +4,8 @@ import numpy as np
 import json
 import os
 import tempfile
+from flask_cors import CORS
+import psycopg2
 
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -17,6 +19,7 @@ class NumpyEncoder(json.JSONEncoder):
 
 app = Flask(__name__)
 app.json_encoder = NumpyEncoder
+CORS(app, origins=["http://localhost:5173"])
 
 @app.route('/analyze', methods=['POST'])
 def analyze_face():
@@ -85,65 +88,83 @@ def analyze_face():
             os.unlink(temp_file.name)
         return jsonify({"error": str(e)}), 500
 
+
+
+def get_user_image_bytes(user_id):
+    conn = psycopg2.connect(
+        dbname="users_db",
+        user="postgres",
+        password="root",
+        host="localhost",
+        port="5432"
+    )
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT image 
+        FROM user_image 
+        JOIN user_entity ON user_image.user_id = user_entity.id 
+        WHERE user_entity.id = %s AND user_image.type = %s
+    """, (user_id, "PROFILE"))
+    result = cur.fetchone()
+    conn.close()
+    if result:
+        return result[0]
+    return None
+
+def convert_numpy(obj):
+    if isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {key: convert_numpy(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy(item) for item in obj]
+    return obj
+
 @app.route('/verify', methods=['POST'])
 def verify_faces():
     temp_files = []
     try:
-        if request.content_type and 'multipart/form-data' in request.content_type:
-            # Vérifier la présence des fichiers
-            if 'img1' not in request.files or 'img2' not in request.files:
-                return jsonify({"error": "Fichiers 'img1' et 'img2' requis"}), 400
-            
-            file1 = request.files['img1']
-            file2 = request.files['img2']
-            
-            # Créer fichiers temporaires
-            temp1 = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
-            temp2 = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
-            
-            file1.save(temp1.name)
-            file2.save(temp2.name)
+        # Récupérer image 1 envoyée par form-data
+        if 'img' not in request.files:
+            return jsonify({"error": "Fichier 'img' requis"}), 400
 
-            # IMPORTANT : fermer avant utilisation
-            temp1.close()
-            temp2.close()
-            
-            temp_files = [temp1.name, temp2.name]
-            img1_path, img2_path = temp1.name, temp2.name
+        file1 = request.files['img']
+        temp1 = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+        file1.save(temp1.name)
+        temp1.close()
+        temp_files.append(temp1.name)
+        img1_path = temp1.name
 
-        elif request.content_type == 'application/json':
-            data = request.json
-            img1_path = data.get('img1_path')
-            img2_path = data.get('img2_path')
-            
-            if not img1_path or not img2_path:
-                return jsonify({"error": "Champs 'img1_path' et 'img2_path' requis"}), 400
-        else:
-            return jsonify({"error": "Type de contenu non supporté"}), 400
-        
-        # Vérifier l’existence
-        if not os.path.exists(img1_path) or not os.path.exists(img2_path):
-            return jsonify({"error": "Un ou plusieurs fichiers non trouvés"}), 400
-        
-        # Comparer avec DeepFace
+        # Vérifier que le fichier existe
+        if not os.path.exists(img1_path):
+            return jsonify({"error": "img1 introuvable"}), 400
+
+        # Récupérer userId
+        user_id = request.form.get('userId') or request.args.get('userId')
+        if not user_id:
+            return jsonify({"error": "Paramètre 'userId' manquant"}), 400
+
+        # Récupérer image 2 depuis DB
+        image2_bytes = get_user_image_bytes(user_id)
+        if not image2_bytes:
+            return jsonify({"error": f"Aucune image trouvée pour l'utilisateur {user_id}"}), 404
+
+        temp2 = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg')
+        temp2.write(image2_bytes)
+        temp2.close()
+        temp_files.append(temp2.name)
+        img2_path = temp2.name
+
+        if not os.path.exists(img2_path):
+            return jsonify({"error": "img2 introuvable"}), 400
+
+        # DeepFace verify
         result = DeepFace.verify(img1_path, img2_path)
-        
-        # Conversion numpy → types natifs
-        def convert_numpy(obj):
-            if isinstance(obj, np.integer):
-                return int(obj)
-            elif isinstance(obj, np.floating):
-                return float(obj)
-            elif isinstance(obj, np.ndarray):
-                return obj.tolist()
-            elif isinstance(obj, dict):
-                return {key: convert_numpy(value) for key, value in obj.items()}
-            elif isinstance(obj, list):
-                return [convert_numpy(item) for item in obj]
-            return obj
-
         result = convert_numpy(result)
-
         return jsonify(result)
 
     except Exception as e:
@@ -154,9 +175,9 @@ def verify_faces():
         for f in temp_files:
             if os.path.exists(f):
                 try:
-                    os.remove(f)
-                except PermissionError:
-                    print(f"Impossible de supprimer {f} (encore utilisé)")
+                    os.unlink(f)
+                except:
+                    pass
 
 @app.route('/extract_faces', methods=['POST'])
 def extract_faces():
